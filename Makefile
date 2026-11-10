@@ -4,13 +4,14 @@ APP_NAME := Headphone Monitor
 APP_PATH := dist/$(APP_NAME).app
 
 .DEFAULT_GOAL := all
-.PHONY: all help build verify run install package clean
+.PHONY: all help build test verify run install package clean
 
 all: verify
 
 help:
 	@printf '%s\n' \
 		'make build    Build and sign the app bundle' \
+		'make test     Run deterministic metrics tests' \
 		'make verify   Build and run repository checks' \
 		'make run      Build and launch the app' \
 		'make package  Build, verify, zip, and checksum' \
@@ -20,7 +21,10 @@ help:
 build:
 	./build.sh
 
-verify: build
+test:
+	./scripts/test.sh
+
+verify: build test
 	./scripts/verify.sh
 
 run: build

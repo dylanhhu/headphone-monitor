@@ -48,6 +48,23 @@ The bridge is allocated before either callback starts. Ring indices are C11 atom
 
 The input callback starts first. For separate devices, output starts only after the bridge contains at least its target frame count. Shutdown stops the device, then destroys the I/O procedure and frees bridge memory.
 
+## Performance Counters
+
+The real-time callbacks record fixed-size metrics through C11 atomics:
+
+- Callback invocation counts
+- Monotonic time spent copying or bridging frames
+- Callback work exceeding one buffer period
+- Callback host-time gaps exceeding the expected period plus a fixed jitter allowance
+- Ring-buffer overflow, underrun, and drift-correction frames
+- `kAudioDeviceProcessorOverload` property notifications
+
+The main thread samples these counters once per second and updates the menu. It computes callback rates, average work, and bridge occupancy without affecting audio deadlines.
+
+Each menu row carries an explicit `INFO`, `OK`, `WARN`, or `ERROR` label. The summary derives from individual counter thresholds, and the status icon changes to an orange warning triangle or red error octagon while monitoring.
+
+The counters describe application-visible symptoms. They do not expose driver-internal drops or hardware glitches that never produce a late callback or CoreAudio overload notification.
+
 ## Processing Boundary
 
 The application does not create an AudioUnit, AVAudioEngine graph, or voice-processing unit. It does not resample, amplify, filter, gate, denoise, record, or persist samples.

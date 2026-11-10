@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static const UInt32 kRingCapacityFrames = 16384;
 static const UInt32 kRingMask = kRingCapacityFrames - 1;
@@ -20,6 +21,29 @@ typedef enum {
 } MonitorError;
 
 typedef struct {
+    _Atomic uint64_t inputCallbacks;
+    _Atomic uint64_t outputCallbacks;
+    _Atomic uint64_t deadlineMisses;
+    _Atomic uint64_t cadenceMisses;
+    _Atomic uint64_t callbackWorkNs;
+    _Atomic uint64_t maxCallbackWorkNs;
+    _Atomic uint64_t maxCadenceGapNs;
+    _Atomic uint64_t inputDropEvents;
+    _Atomic uint64_t inputDropFrames;
+    _Atomic uint64_t outputUnderrunEvents;
+    _Atomic uint64_t outputUnderrunFrames;
+    _Atomic uint64_t driftCorrectionEvents;
+    _Atomic uint64_t driftCorrectionFrames;
+    _Atomic uint64_t maxRingFrames;
+    _Atomic uint64_t deviceOverloads;
+} AudioMetrics;
+
+typedef struct {
+    uint64_t previousHostTimeNs;
+    BOOL hasPreviousHostTime;
+} CallbackTiming;
+
+typedef struct {
     float *samples;
     float *scratch;
     _Atomic uint64_t writeFrame;
@@ -27,6 +51,7 @@ typedef struct {
     UInt32 targetFrames;
     UInt32 outputFrames;
     float lastSample;
+    AudioMetrics *metrics;
 } AudioRing;
 
 typedef struct {
@@ -42,9 +67,92 @@ typedef struct {
     BOOL inputStarted;
     BOOL outputStarted;
     BOOL duplexStarted;
+    BOOL inputOverloadListenerInstalled;
+    BOOL outputOverloadListenerInstalled;
     BOOL running;
+    double sampleRate;
+    AudioMetrics metrics;
+    CallbackTiming inputTiming;
+    CallbackTiming outputTiming;
+    CallbackTiming duplexTiming;
     AudioRing ring;
 } MonitorEngine;
+
+static uint64_t MonotonicNanoseconds(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void AtomicUpdateMax(_Atomic uint64_t *target, uint64_t value) {
+    uint64_t current = atomic_load_explicit(target, memory_order_relaxed);
+    while (value > current &&
+           !atomic_compare_exchange_weak_explicit(target, &current, value,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+    }
+}
+
+static void ResetMetrics(AudioMetrics *metrics) {
+    atomic_store_explicit(&metrics->inputCallbacks, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->outputCallbacks, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->deadlineMisses, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->cadenceMisses, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->callbackWorkNs, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->maxCallbackWorkNs, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->maxCadenceGapNs, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->inputDropEvents, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->inputDropFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->outputUnderrunEvents, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->outputUnderrunFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->driftCorrectionEvents, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->driftCorrectionFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->maxRingFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->deviceOverloads, 0, memory_order_relaxed);
+}
+
+static void RecordCallback(AudioMetrics *metrics,
+                           CallbackTiming *timing,
+                           BOOL countsInput,
+                           BOOL countsOutput,
+                           const AudioTimeStamp *now,
+                           UInt32 frames,
+                           double sampleRate,
+                           uint64_t workNs) {
+    if (countsInput) {
+        atomic_fetch_add_explicit(&metrics->inputCallbacks, 1, memory_order_relaxed);
+    }
+    if (countsOutput) {
+        atomic_fetch_add_explicit(&metrics->outputCallbacks, 1, memory_order_relaxed);
+    }
+    atomic_fetch_add_explicit(&metrics->callbackWorkNs, workNs, memory_order_relaxed);
+    AtomicUpdateMax(&metrics->maxCallbackWorkNs, workNs);
+
+    if (frames == 0 || sampleRate <= 0) {
+        return;
+    }
+    uint64_t periodNs = (uint64_t)((double)frames * 1000000000.0 / sampleRate);
+    if (periodNs > 0 && workNs > periodNs) {
+        atomic_fetch_add_explicit(&metrics->deadlineMisses, 1, memory_order_relaxed);
+    }
+
+    if (now == NULL || (now->mFlags & kAudioTimeStampHostTimeValid) == 0 ||
+        now->mHostTime == 0) {
+        return;
+    }
+    uint64_t hostTimeNs = AudioConvertHostTimeToNanos(now->mHostTime);
+    if (timing->hasPreviousHostTime && hostTimeNs > timing->previousHostTimeNs) {
+        uint64_t gapNs = hostTimeNs - timing->previousHostTimeNs;
+        AtomicUpdateMax(&metrics->maxCadenceGapNs, gapNs);
+        uint64_t toleranceNs = periodNs / 2;
+        if (toleranceNs < 250000) {
+            toleranceNs = 250000;
+        }
+        if (gapNs > periodNs + toleranceNs) {
+            atomic_fetch_add_explicit(&metrics->cadenceMisses, 1, memory_order_relaxed);
+        }
+    }
+    timing->previousHostTimeNs = hostTimeNs;
+    timing->hasPreviousHostTime = YES;
+}
 
 static BOOL FormatIsFloat32(const AudioStreamBasicDescription *format) {
     return format != NULL &&
@@ -165,11 +273,17 @@ static void RingPushFirstChannel(AudioRing *ring, const AudioBufferList *inputDa
     UInt32 used = (UInt32)(write - read);
     UInt32 available = used < kRingCapacityFrames ? kRingCapacityFrames - used : 0;
     UInt32 count = frames < available ? frames : available;
+    if (count < frames) {
+        atomic_fetch_add_explicit(&ring->metrics->inputDropEvents, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ring->metrics->inputDropFrames, frames - count,
+                                  memory_order_relaxed);
+    }
 
     for (UInt32 frame = 0; frame < count; frame++) {
         ring->samples[(write + frame) & kRingMask] = input[frame * inputChannels];
     }
     atomic_store_explicit(&ring->writeFrame, write + count, memory_order_release);
+    AtomicUpdateMax(&ring->metrics->maxRingFrames, used + count);
 }
 
 static void RingFillOutput(AudioRing *ring, AudioBufferList *outputData) {
@@ -184,6 +298,10 @@ static void RingFillOutput(AudioRing *ring, AudioBufferList *outputData) {
 
     UInt32 highWater = ring->targetFrames + ring->outputFrames * 2;
     if (available64 > highWater) {
+        atomic_fetch_add_explicit(&ring->metrics->driftCorrectionEvents, 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&ring->metrics->driftCorrectionFrames, 1,
+                                  memory_order_relaxed);
         read++;
         atomic_store_explicit(&ring->readFrame, read, memory_order_release);
         available64--;
@@ -191,6 +309,12 @@ static void RingFillOutput(AudioRing *ring, AudioBufferList *outputData) {
 
     UInt32 available = available64 > UINT32_MAX ? UINT32_MAX : (UInt32)available64;
     UInt32 count = frames < available ? frames : available;
+    if (count < frames) {
+        atomic_fetch_add_explicit(&ring->metrics->outputUnderrunEvents, 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&ring->metrics->outputUnderrunFrames, frames - count,
+                                  memory_order_relaxed);
+    }
     for (UInt32 frame = 0; frame < count; frame++) {
         ring->scratch[frame] = ring->samples[(read + frame) & kRingMask];
     }
@@ -285,12 +409,17 @@ static OSStatus DuplexIOProc(AudioObjectID device,
                              AudioBufferList *outputData,
                              const AudioTimeStamp *outputTime,
                              void *clientData) {
+    MonitorEngine *engine = (MonitorEngine *)clientData;
+    uint64_t startNs = MonotonicNanoseconds();
     (void)device;
-    (void)now;
     (void)inputTime;
     (void)outputTime;
-    (void)clientData;
     CopyFirstInputChannel(inputData, outputData);
+    uint64_t workNs = MonotonicNanoseconds() - startNs;
+    UInt32 frames = outputData != NULL && outputData->mNumberBuffers > 0 ?
+                    FrameCountForBuffer(&outputData->mBuffers[0]) : 0;
+    RecordCallback(&engine->metrics, &engine->duplexTiming, YES, YES, now,
+                   frames, engine->sampleRate, workNs);
     return noErr;
 }
 
@@ -301,12 +430,18 @@ static OSStatus InputIOProc(AudioObjectID device,
                             AudioBufferList *outputData,
                             const AudioTimeStamp *outputTime,
                             void *clientData) {
+    MonitorEngine *engine = (MonitorEngine *)clientData;
+    uint64_t startNs = MonotonicNanoseconds();
     (void)device;
-    (void)now;
     (void)inputTime;
     (void)outputData;
     (void)outputTime;
-    RingPushFirstChannel((AudioRing *)clientData, inputData);
+    RingPushFirstChannel(&engine->ring, inputData);
+    uint64_t workNs = MonotonicNanoseconds() - startNs;
+    UInt32 frames = inputData != NULL && inputData->mNumberBuffers > 0 ?
+                    FrameCountForBuffer(&inputData->mBuffers[0]) : 0;
+    RecordCallback(&engine->metrics, &engine->inputTiming, YES, NO, now,
+                   frames, engine->sampleRate, workNs);
     return noErr;
 }
 
@@ -317,13 +452,70 @@ static OSStatus OutputIOProc(AudioObjectID device,
                              AudioBufferList *outputData,
                              const AudioTimeStamp *outputTime,
                              void *clientData) {
+    MonitorEngine *engine = (MonitorEngine *)clientData;
+    uint64_t startNs = MonotonicNanoseconds();
     (void)device;
-    (void)now;
     (void)inputData;
     (void)inputTime;
     (void)outputTime;
-    RingFillOutput((AudioRing *)clientData, outputData);
+    RingFillOutput(&engine->ring, outputData);
+    uint64_t workNs = MonotonicNanoseconds() - startNs;
+    UInt32 frames = outputData != NULL && outputData->mNumberBuffers > 0 ?
+                    FrameCountForBuffer(&outputData->mBuffers[0]) : 0;
+    RecordCallback(&engine->metrics, &engine->outputTiming, NO, YES, now,
+                   frames, engine->sampleRate, workNs);
     return noErr;
+}
+
+static OSStatus DeviceOverloadListener(AudioObjectID objectID,
+                                       UInt32 addressCount,
+                                       const AudioObjectPropertyAddress *addresses,
+                                       void *clientData) {
+    (void)objectID;
+    MonitorEngine *engine = (MonitorEngine *)clientData;
+    for (UInt32 i = 0; i < addressCount; i++) {
+        if (addresses[i].mSelector == kAudioDeviceProcessorOverload) {
+            atomic_fetch_add_explicit(&engine->metrics.deviceOverloads, 1,
+                                      memory_order_relaxed);
+        }
+    }
+    return noErr;
+}
+
+static void InstallOverloadListener(MonitorEngine *engine,
+                                    AudioDeviceID device,
+                                    BOOL isInput) {
+    AudioObjectPropertyAddress address = {
+        kAudioDeviceProcessorOverload,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    if (AudioObjectAddPropertyListener(device, &address, DeviceOverloadListener,
+                                       engine) == noErr) {
+        if (isInput) {
+            engine->inputOverloadListenerInstalled = YES;
+        } else {
+            engine->outputOverloadListenerInstalled = YES;
+        }
+    }
+}
+
+static void RemoveOverloadListeners(MonitorEngine *engine) {
+    AudioObjectPropertyAddress address = {
+        kAudioDeviceProcessorOverload,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    if (engine->inputOverloadListenerInstalled) {
+        AudioObjectRemovePropertyListener(engine->inputDevice, &address,
+                                          DeviceOverloadListener, engine);
+        engine->inputOverloadListenerInstalled = NO;
+    }
+    if (engine->outputOverloadListenerInstalled) {
+        AudioObjectRemovePropertyListener(engine->outputDevice, &address,
+                                          DeviceOverloadListener, engine);
+        engine->outputOverloadListenerInstalled = NO;
+    }
 }
 
 static void StopEngine(MonitorEngine *engine) {
@@ -345,6 +537,7 @@ static void StopEngine(MonitorEngine *engine) {
     if (engine->inputProcID != NULL) {
         AudioDeviceDestroyIOProcID(engine->inputDevice, engine->inputProcID);
     }
+    RemoveOverloadListeners(engine);
     free(engine->ring.samples);
     free(engine->ring.scratch);
     engine->ring.samples = NULL;
@@ -370,12 +563,14 @@ static OSStatus StartEngine(MonitorEngine *engine,
     memset(engine, 0, sizeof(*engine));
     engine->inputDevice = inputDevice;
     engine->outputDevice = outputDevice;
+    ResetMetrics(&engine->metrics);
 
     double inputRate = GetNominalSampleRate(inputDevice);
     double outputRate = GetNominalSampleRate(outputDevice);
     if (inputRate <= 0 || outputRate <= 0 || fabs(inputRate - outputRate) > 0.5) {
         return MonitorErrorSampleRateMismatch;
     }
+    engine->sampleRate = inputRate;
 
     OSStatus status = SetBufferFrameSize(inputDevice, requestedBufferFrames,
                                          &engine->inputBufferFrames);
@@ -398,6 +593,7 @@ static OSStatus StartEngine(MonitorEngine *engine,
     }
 
     if (inputDevice == outputDevice) {
+        InstallOverloadListener(engine, inputDevice, YES);
         status = AudioDeviceCreateIOProcID(inputDevice, DuplexIOProc, engine,
                                            &engine->duplexProcID);
         if (status != noErr) {
@@ -428,16 +624,19 @@ static OSStatus StartEngine(MonitorEngine *engine,
         engine->ring.targetFrames = 2;
     }
     engine->ring.outputFrames = engine->outputBufferFrames;
+    engine->ring.metrics = &engine->metrics;
     atomic_init(&engine->ring.writeFrame, 0);
     atomic_init(&engine->ring.readFrame, 0);
+    InstallOverloadListener(engine, inputDevice, YES);
+    InstallOverloadListener(engine, outputDevice, NO);
 
-    status = AudioDeviceCreateIOProcID(inputDevice, InputIOProc, &engine->ring,
+    status = AudioDeviceCreateIOProcID(inputDevice, InputIOProc, engine,
                                        &engine->inputProcID);
     if (status != noErr) {
         StopEngine(engine);
         return status;
     }
-    status = AudioDeviceCreateIOProcID(outputDevice, OutputIOProc, &engine->ring,
+    status = AudioDeviceCreateIOProcID(outputDevice, OutputIOProc, engine,
                                        &engine->outputProcID);
     if (status != noErr) {
         StopEngine(engine);
@@ -570,6 +769,102 @@ static NSString *StartErrorDescription(OSStatus status) {
     }
 }
 
+typedef struct {
+    uint64_t inputCallbacks;
+    uint64_t outputCallbacks;
+    uint64_t deadlineMisses;
+    uint64_t cadenceMisses;
+    uint64_t callbackWorkNs;
+    uint64_t maxCallbackWorkNs;
+    uint64_t maxCadenceGapNs;
+    uint64_t inputDropEvents;
+    uint64_t inputDropFrames;
+    uint64_t outputUnderrunEvents;
+    uint64_t outputUnderrunFrames;
+    uint64_t driftCorrectionEvents;
+    uint64_t driftCorrectionFrames;
+    uint64_t maxRingFrames;
+    uint64_t deviceOverloads;
+    uint64_t ringFrames;
+} MetricsSnapshot;
+
+static MetricsSnapshot SnapshotMetrics(const MonitorEngine *engine) {
+    MetricsSnapshot snapshot = {
+        .inputCallbacks = atomic_load_explicit(&engine->metrics.inputCallbacks,
+                                               memory_order_relaxed),
+        .outputCallbacks = atomic_load_explicit(&engine->metrics.outputCallbacks,
+                                                memory_order_relaxed),
+        .deadlineMisses = atomic_load_explicit(&engine->metrics.deadlineMisses,
+                                               memory_order_relaxed),
+        .cadenceMisses = atomic_load_explicit(&engine->metrics.cadenceMisses,
+                                              memory_order_relaxed),
+        .callbackWorkNs = atomic_load_explicit(&engine->metrics.callbackWorkNs,
+                                               memory_order_relaxed),
+        .maxCallbackWorkNs = atomic_load_explicit(&engine->metrics.maxCallbackWorkNs,
+                                                   memory_order_relaxed),
+        .maxCadenceGapNs = atomic_load_explicit(&engine->metrics.maxCadenceGapNs,
+                                                 memory_order_relaxed),
+        .inputDropEvents = atomic_load_explicit(&engine->metrics.inputDropEvents,
+                                                memory_order_relaxed),
+        .inputDropFrames = atomic_load_explicit(&engine->metrics.inputDropFrames,
+                                                memory_order_relaxed),
+        .outputUnderrunEvents = atomic_load_explicit(&engine->metrics.outputUnderrunEvents,
+                                                      memory_order_relaxed),
+        .outputUnderrunFrames = atomic_load_explicit(&engine->metrics.outputUnderrunFrames,
+                                                      memory_order_relaxed),
+        .driftCorrectionEvents = atomic_load_explicit(&engine->metrics.driftCorrectionEvents,
+                                                       memory_order_relaxed),
+        .driftCorrectionFrames = atomic_load_explicit(&engine->metrics.driftCorrectionFrames,
+                                                       memory_order_relaxed),
+        .maxRingFrames = atomic_load_explicit(&engine->metrics.maxRingFrames,
+                                              memory_order_relaxed),
+        .deviceOverloads = atomic_load_explicit(&engine->metrics.deviceOverloads,
+                                                memory_order_relaxed),
+    };
+    if (engine->ring.samples != NULL) {
+        uint64_t write = atomic_load_explicit(&engine->ring.writeFrame, memory_order_acquire);
+        uint64_t read = atomic_load_explicit(&engine->ring.readFrame, memory_order_relaxed);
+        snapshot.ringFrames = write > read ? write - read : 0;
+    }
+    return snapshot;
+}
+
+typedef NS_ENUM(NSInteger, PerformanceMenuTag) {
+    PerformanceStatusTag = 2001,
+    PerformanceModeTag,
+    PerformanceFormatTag,
+    PerformanceCallbacksTag,
+    PerformanceWorkTag,
+    PerformanceDeadlinesTag,
+    PerformanceCadenceTag,
+    PerformanceBridgeTag,
+    PerformanceUnderrunsTag,
+    PerformanceInputDropsTag,
+    PerformanceDriftTag,
+    PerformanceOverloadsTag,
+};
+
+typedef NS_ENUM(NSInteger, PerformanceSeverity) {
+    PerformanceSeverityInfo = 0,
+    PerformanceSeverityOK,
+    PerformanceSeverityWarning,
+    PerformanceSeverityError,
+};
+
+static NSString *PerformanceSeverityLabel(PerformanceSeverity severity) {
+    switch (severity) {
+        case PerformanceSeverityWarning:
+            return @"WARN ";
+        case PerformanceSeverityError:
+            return @"ERROR";
+        case PerformanceSeverityOK:
+            return @"OK   ";
+        case PerformanceSeverityInfo:
+        default:
+            return @"INFO ";
+    }
+}
+
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMenu *menu;
@@ -577,6 +872,12 @@ static NSString *StartErrorDescription(OSStatus status) {
 @property(nonatomic, assign) AudioDeviceID outputDevice;
 @property(nonatomic, assign) UInt32 requestedBufferFrames;
 @property(nonatomic, assign) BOOL running;
+@property(nonatomic, strong) NSTimer *metricsTimer;
+@property(nonatomic, strong) NSMenuItem *performanceRoot;
+@property(nonatomic, strong) NSMenu *performanceSubmenu;
+@property(nonatomic, assign) uint64_t previousInputCallbacks;
+@property(nonatomic, assign) uint64_t previousOutputCallbacks;
+@property(nonatomic, assign) uint64_t previousMetricsTimeNs;
 @end
 
 @implementation AppDelegate {
@@ -600,6 +901,14 @@ static NSString *StartErrorDescription(OSStatus status) {
     self.running = NO;
 
     [self rebuildMenu];
+    __weak typeof(self) weakSelf = self;
+    self.metricsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                        repeats:YES
+                                                          block:^(NSTimer *timer) {
+        (void)timer;
+        [weakSelf updatePerformanceDisplay];
+    }];
+    [self resetMetricsBaseline];
 }
 
 - (void)rebuildMenu {
@@ -621,6 +930,8 @@ static NSString *StartErrorDescription(OSStatus status) {
     [menu addItem:[self deviceMenuItemWithTitle:@"Output Device" scope:kAudioObjectPropertyScopeOutput]];
     [menu addItem:[NSMenuItem separatorItem]];
     [menu addItem:[self bufferMenuItem]];
+    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItem:[self performanceMenuItem]];
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *about = [[NSMenuItem alloc] initWithTitle:@"About Headphone Monitor"
@@ -675,6 +986,315 @@ static NSString *StartErrorDescription(OSStatus status) {
     }
     root.submenu = submenu;
     return root;
+}
+
+- (NSMenuItem *)performanceMetricItemWithTitle:(NSString *)title tag:(PerformanceMenuTag)tag {
+    NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:nil keyEquivalent:@""];
+    item.enabled = NO;
+    item.tag = tag;
+    return item;
+}
+
+- (NSMenuItem *)performanceMenuItem {
+    NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"Performance" action:nil keyEquivalent:@""];
+    NSMenu *submenu = [[NSMenu alloc] initWithTitle:@"Performance"];
+
+    [submenu addItem:[self performanceMetricItemWithTitle:@"INFO  Status: unavailable"
+                                                       tag:PerformanceStatusTag]];
+    [submenu addItem:[NSMenuItem separatorItem]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"No audio session data"
+                                                       tag:PerformanceModeTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Format: unavailable"
+                                                       tag:PerformanceFormatTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Callbacks: unavailable"
+                                                       tag:PerformanceCallbacksTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Callback work: unavailable"
+                                                       tag:PerformanceWorkTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Deadline misses: unavailable"
+                                                       tag:PerformanceDeadlinesTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Cadence misses: unavailable"
+                                                       tag:PerformanceCadenceTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Bridge: unavailable"
+                                                       tag:PerformanceBridgeTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Output underruns: unavailable"
+                                                       tag:PerformanceUnderrunsTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Input drops: unavailable"
+                                                       tag:PerformanceInputDropsTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Drift corrections: unavailable"
+                                                       tag:PerformanceDriftTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"CoreAudio overloads: unavailable"
+                                                       tag:PerformanceOverloadsTag]];
+    [submenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *reset = [[NSMenuItem alloc] initWithTitle:@"Reset Counters"
+                                                  action:@selector(resetMetrics:)
+                                           keyEquivalent:@""];
+    reset.target = self;
+    [submenu addItem:reset];
+
+    root.submenu = submenu;
+    self.performanceRoot = root;
+    self.performanceSubmenu = submenu;
+    return root;
+}
+
+- (void)setPerformanceTitle:(NSString *)title
+                     forTag:(PerformanceMenuTag)tag
+                   severity:(PerformanceSeverity)severity {
+    NSMenuItem *item = [self.performanceSubmenu itemWithTag:tag];
+    item.title = [NSString stringWithFormat:@"%@  %@", PerformanceSeverityLabel(severity), title];
+}
+
+- (void)setPerformanceTitle:(NSString *)title forTag:(PerformanceMenuTag)tag {
+    [self setPerformanceTitle:title forTag:tag severity:PerformanceSeverityInfo];
+}
+
+- (void)resetMetricsBaseline {
+    MetricsSnapshot snapshot = SnapshotMetrics(&_engine);
+    self.previousInputCallbacks = snapshot.inputCallbacks;
+    self.previousOutputCallbacks = snapshot.outputCallbacks;
+    self.previousMetricsTimeNs = MonotonicNanoseconds();
+}
+
+- (void)updatePerformanceDisplay {
+    MetricsSnapshot snapshot = SnapshotMetrics(&_engine);
+    uint64_t nowNs = MonotonicNanoseconds();
+    double elapsedSeconds = self.previousMetricsTimeNs > 0 && nowNs > self.previousMetricsTimeNs ?
+                            (double)(nowNs - self.previousMetricsTimeNs) / 1000000000.0 : 0;
+    double inputRate = 0;
+    double outputRate = 0;
+    if (elapsedSeconds > 0) {
+        if (snapshot.inputCallbacks >= self.previousInputCallbacks) {
+            inputRate = (double)(snapshot.inputCallbacks - self.previousInputCallbacks) / elapsedSeconds;
+        }
+        if (snapshot.outputCallbacks >= self.previousOutputCallbacks) {
+            outputRate = (double)(snapshot.outputCallbacks - self.previousOutputCallbacks) / elapsedSeconds;
+        }
+    }
+    self.previousInputCallbacks = snapshot.inputCallbacks;
+    self.previousOutputCallbacks = snapshot.outputCallbacks;
+    self.previousMetricsTimeNs = nowNs;
+
+    uint64_t callbacks = snapshot.inputCallbacks + snapshot.outputCallbacks;
+    if (callbacks == 0) {
+        [self setPerformanceTitle:@"Status: no audio session data"
+                           forTag:PerformanceStatusTag
+                         severity:PerformanceSeverityInfo];
+        [self setPerformanceTitle:@"No audio session data" forTag:PerformanceModeTag];
+        [self setPerformanceTitle:@"Format: unavailable" forTag:PerformanceFormatTag];
+        [self setPerformanceTitle:@"Callbacks: unavailable" forTag:PerformanceCallbacksTag];
+        [self setPerformanceTitle:@"Callback work: unavailable" forTag:PerformanceWorkTag];
+        [self setPerformanceTitle:@"Deadline misses: unavailable" forTag:PerformanceDeadlinesTag];
+        [self setPerformanceTitle:@"Cadence misses: unavailable" forTag:PerformanceCadenceTag];
+        [self setPerformanceTitle:@"Bridge: unavailable" forTag:PerformanceBridgeTag];
+        [self setPerformanceTitle:@"Output underruns: unavailable" forTag:PerformanceUnderrunsTag];
+        [self setPerformanceTitle:@"Input drops: unavailable" forTag:PerformanceInputDropsTag];
+        [self setPerformanceTitle:@"Drift corrections: unavailable" forTag:PerformanceDriftTag];
+        [self setPerformanceTitle:@"CoreAudio overloads: unavailable" forTag:PerformanceOverloadsTag];
+        self.performanceRoot.title = @"Performance";
+        self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"mic.fill"
+                                                 accessibilityDescription:@"Headphone Monitor"];
+        self.statusItem.button.image.template = YES;
+        self.statusItem.button.contentTintColor = nil;
+        self.statusItem.button.toolTip = @"Headphone Monitor";
+        return;
+    }
+
+    NSUInteger errorCount = 0;
+    NSUInteger warningCount = 0;
+    BOOL direct = _engine.inputDevice == _engine.outputDevice;
+    [self setPerformanceTitle:(direct ? @"Mode: direct device callback" : @"Mode: bridged devices")
+                       forTag:PerformanceModeTag];
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Format: %.1f kHz, %u in / %u out frames",
+                                                         _engine.sampleRate / 1000.0,
+                                                         _engine.inputBufferFrames,
+                                                         _engine.outputBufferFrames]
+                       forTag:PerformanceFormatTag];
+
+    PerformanceSeverity callbackSeverity = PerformanceSeverityInfo;
+    NSString *callbackTitle = @"Callbacks: stopped";
+    if (self.running && _engine.sampleRate > 0 && _engine.inputBufferFrames > 0 &&
+        _engine.outputBufferFrames > 0) {
+        double expectedInputRate = _engine.sampleRate / _engine.inputBufferFrames;
+        double expectedOutputRate = _engine.sampleRate / _engine.outputBufferFrames;
+        double inputRatio = expectedInputRate > 0 ? inputRate / expectedInputRate : 1;
+        double outputRatio = expectedOutputRate > 0 ? outputRate / expectedOutputRate : 1;
+        double minimumRatio = inputRatio < outputRatio ? inputRatio : outputRatio;
+        callbackSeverity = minimumRatio < 0.5 ? PerformanceSeverityError :
+                           minimumRatio < 0.8 ? PerformanceSeverityWarning :
+                           PerformanceSeverityOK;
+        callbackTitle = [NSString stringWithFormat:@"Callbacks: %.0f/s input, %.0f/s output",
+                                                    inputRate, outputRate];
+    }
+    [self setPerformanceTitle:callbackTitle forTag:PerformanceCallbacksTag severity:callbackSeverity];
+    if (callbackSeverity == PerformanceSeverityError) {
+        errorCount++;
+    } else if (callbackSeverity == PerformanceSeverityWarning) {
+        warningCount++;
+    }
+
+    double averageWorkMs = callbacks > 0 ?
+                           ((double)snapshot.callbackWorkNs / (double)callbacks) / 1000000.0 : 0;
+    double maximumWorkMs = (double)snapshot.maxCallbackWorkNs / 1000000.0;
+    double inputBudgetMs = _engine.sampleRate > 0 ?
+                           (double)_engine.inputBufferFrames * 1000.0 / _engine.sampleRate : 0;
+    double outputBudgetMs = _engine.sampleRate > 0 ?
+                            (double)_engine.outputBufferFrames * 1000.0 / _engine.sampleRate : 0;
+    double shortestBudgetMs = inputBudgetMs;
+    if (outputBudgetMs > 0 && (shortestBudgetMs <= 0 || outputBudgetMs < shortestBudgetMs)) {
+        shortestBudgetMs = outputBudgetMs;
+    }
+    double workRatio = shortestBudgetMs > 0 ? maximumWorkMs / shortestBudgetMs : 0;
+    PerformanceSeverity workSeverity = workRatio >= 1.0 ? PerformanceSeverityError :
+                                       workRatio >= 0.75 ? PerformanceSeverityWarning :
+                                       PerformanceSeverityOK;
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Callback work: %.3f ms avg, %.3f ms max",
+                                                         averageWorkMs, maximumWorkMs]
+                       forTag:PerformanceWorkTag
+                     severity:workSeverity];
+    if (workSeverity == PerformanceSeverityError) {
+        errorCount++;
+    } else if (workSeverity == PerformanceSeverityWarning) {
+        warningCount++;
+    }
+
+    PerformanceSeverity deadlineSeverity = snapshot.deadlineMisses > 0 ?
+                                           PerformanceSeverityError : PerformanceSeverityOK;
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Deadline misses: %llu, budget %.3f / %.3f ms",
+                                                         (unsigned long long)snapshot.deadlineMisses,
+                                                         inputBudgetMs, outputBudgetMs]
+                       forTag:PerformanceDeadlinesTag
+                     severity:deadlineSeverity];
+    if (deadlineSeverity == PerformanceSeverityError) {
+        errorCount++;
+    }
+
+    PerformanceSeverity cadenceSeverity = snapshot.cadenceMisses == 0 ? PerformanceSeverityOK :
+        (callbacks > 0 && snapshot.cadenceMisses * 1000 >= callbacks) ? PerformanceSeverityError :
+        PerformanceSeverityWarning;
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Cadence misses: %llu, max gap %.3f ms",
+                                                         (unsigned long long)snapshot.cadenceMisses,
+                                                         (double)snapshot.maxCadenceGapNs / 1000000.0]
+                       forTag:PerformanceCadenceTag
+                     severity:cadenceSeverity];
+    if (cadenceSeverity == PerformanceSeverityError) {
+        errorCount++;
+    } else if (cadenceSeverity == PerformanceSeverityWarning) {
+        warningCount++;
+    }
+
+    if (!direct && self.running && _engine.ring.samples != NULL) {
+        double fillMs = _engine.sampleRate > 0 ?
+                        (double)snapshot.ringFrames * 1000.0 / _engine.sampleRate : 0;
+        double maxFillMs = _engine.sampleRate > 0 ?
+                           (double)snapshot.maxRingFrames * 1000.0 / _engine.sampleRate : 0;
+        PerformanceSeverity bridgeSeverity = snapshot.ringFrames == 0 ? PerformanceSeverityError :
+                                             snapshot.ringFrames < _engine.ring.targetFrames ?
+                                             PerformanceSeverityWarning : PerformanceSeverityOK;
+        [self setPerformanceTitle:[NSString stringWithFormat:@"Bridge: %llu frames (%.2f ms), max %.2f ms",
+                                                             (unsigned long long)snapshot.ringFrames,
+                                                             fillMs, maxFillMs]
+                           forTag:PerformanceBridgeTag
+                         severity:bridgeSeverity];
+        if (bridgeSeverity == PerformanceSeverityError) {
+            errorCount++;
+        } else if (bridgeSeverity == PerformanceSeverityWarning) {
+            warningCount++;
+        }
+    } else {
+        [self setPerformanceTitle:(direct ? @"Bridge: not used (direct callback)" : @"Bridge: stopped")
+                           forTag:PerformanceBridgeTag
+                         severity:PerformanceSeverityInfo];
+    }
+
+    PerformanceSeverity underrunSeverity = snapshot.outputUnderrunEvents > 0 ?
+                                           PerformanceSeverityError : PerformanceSeverityOK;
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Output underruns: %llu events / %llu frames",
+                                                         (unsigned long long)snapshot.outputUnderrunEvents,
+                                                         (unsigned long long)snapshot.outputUnderrunFrames]
+                       forTag:PerformanceUnderrunsTag
+                     severity:underrunSeverity];
+    if (underrunSeverity == PerformanceSeverityError) {
+        errorCount++;
+    }
+
+    PerformanceSeverity inputDropSeverity = snapshot.inputDropEvents > 0 ?
+                                            PerformanceSeverityError : PerformanceSeverityOK;
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Input drops: %llu events / %llu frames",
+                                                         (unsigned long long)snapshot.inputDropEvents,
+                                                         (unsigned long long)snapshot.inputDropFrames]
+                       forTag:PerformanceInputDropsTag
+                     severity:inputDropSeverity];
+    if (inputDropSeverity == PerformanceSeverityError) {
+        errorCount++;
+    }
+
+    PerformanceSeverity driftSeverity = snapshot.driftCorrectionEvents > 0 ?
+                                        PerformanceSeverityWarning : PerformanceSeverityOK;
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Drift corrections: %llu events / %llu frames",
+                                                         (unsigned long long)snapshot.driftCorrectionEvents,
+                                                         (unsigned long long)snapshot.driftCorrectionFrames]
+                       forTag:PerformanceDriftTag
+                     severity:driftSeverity];
+    if (driftSeverity == PerformanceSeverityWarning) {
+        warningCount++;
+    }
+
+    PerformanceSeverity overloadSeverity = snapshot.deviceOverloads > 0 ?
+                                           PerformanceSeverityError : PerformanceSeverityOK;
+    [self setPerformanceTitle:[NSString stringWithFormat:@"CoreAudio overloads: %llu",
+                                                         (unsigned long long)snapshot.deviceOverloads]
+                       forTag:PerformanceOverloadsTag
+                     severity:overloadSeverity];
+    if (overloadSeverity == PerformanceSeverityError) {
+        errorCount++;
+    }
+
+    PerformanceSeverity overallSeverity = errorCount > 0 ? PerformanceSeverityError :
+                                           warningCount > 0 ? PerformanceSeverityWarning :
+                                           PerformanceSeverityOK;
+    if (overallSeverity == PerformanceSeverityError) {
+        [self setPerformanceTitle:[NSString stringWithFormat:@"Status: %lu errors, %lu warnings",
+                                                             (unsigned long)errorCount,
+                                                             (unsigned long)warningCount]
+                           forTag:PerformanceStatusTag
+                         severity:PerformanceSeverityError];
+    } else if (overallSeverity == PerformanceSeverityWarning) {
+        [self setPerformanceTitle:[NSString stringWithFormat:@"Status: %lu warnings",
+                                                             (unsigned long)warningCount]
+                           forTag:PerformanceStatusTag
+                         severity:PerformanceSeverityWarning];
+    } else {
+        [self setPerformanceTitle:@"Status: healthy" forTag:PerformanceStatusTag
+                        severity:PerformanceSeverityOK];
+    }
+
+    self.performanceRoot.title = overallSeverity == PerformanceSeverityError ? @"Performance: ERROR" :
+                                 overallSeverity == PerformanceSeverityWarning ? @"Performance: WARN" :
+                                 @"Performance";
+    NSString *symbol = self.running && overallSeverity == PerformanceSeverityError ? @"xmark.octagon.fill" :
+                       self.running && overallSeverity == PerformanceSeverityWarning ? @"exclamationmark.triangle.fill" :
+                       @"mic.fill";
+    self.statusItem.button.image = [NSImage imageWithSystemSymbolName:symbol
+                                             accessibilityDescription:@"Headphone Monitor"];
+    self.statusItem.button.image.template = YES;
+    self.statusItem.button.contentTintColor =
+        self.running && overallSeverity == PerformanceSeverityError ? [NSColor systemRedColor] :
+        self.running && overallSeverity == PerformanceSeverityWarning ? [NSColor systemOrangeColor] : nil;
+    self.statusItem.button.toolTip = overallSeverity == PerformanceSeverityError ?
+        [NSString stringWithFormat:@"Headphone Monitor: %lu performance errors",
+                                   (unsigned long)errorCount] :
+        overallSeverity == PerformanceSeverityWarning ?
+        [NSString stringWithFormat:@"Headphone Monitor: %lu performance warnings",
+                                   (unsigned long)warningCount] :
+        @"Headphone Monitor: counters healthy";
+}
+
+- (void)resetMetrics:(NSMenuItem *)sender {
+    (void)sender;
+    ResetMetrics(&_engine.metrics);
+    [self resetMetricsBaseline];
+    [self updatePerformanceDisplay];
 }
 
 - (NSMenuItem *)bufferMenuItem {
@@ -737,13 +1357,16 @@ static NSString *StartErrorDescription(OSStatus status) {
         return;
     }
     self.running = YES;
+    [self resetMetricsBaseline];
     [self rebuildMenu];
+    [self updatePerformanceDisplay];
 }
 
 - (void)stopMonitoring {
     StopEngine(&_engine);
     self.running = NO;
     [self rebuildMenu];
+    [self updatePerformanceDisplay];
 }
 
 - (void)toggleMonitoring:(NSMenuItem *)sender {
@@ -772,11 +1395,17 @@ static NSString *StartErrorDescription(OSStatus status) {
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    [self.metricsTimer invalidate];
     StopEngine(&_engine);
+}
+
+- (void)dealloc {
+    [self.metricsTimer invalidate];
 }
 
 @end
 
+#ifndef HEADPHONE_MONITOR_TEST
 int main(int argc, const char *argv[]) {
     (void)argc;
     (void)argv;
@@ -789,3 +1418,4 @@ int main(int argc, const char *argv[]) {
     }
     return 0;
 }
+#endif

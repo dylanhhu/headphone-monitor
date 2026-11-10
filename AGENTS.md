@@ -20,6 +20,7 @@ The application must remain understandable from its source and must not add hidd
 
 ```sh
 make build       # Build and sign dist/Headphone Monitor.app
+make test        # Run deterministic metrics tests
 make verify      # Build and run repository checks
 make run         # Build and launch the app
 make package     # Build, verify, zip, and checksum
@@ -42,6 +43,8 @@ Every `AudioDeviceIOProc` runs on a real-time audio thread. Code reachable from 
 
 Use preallocated buffers, fixed-size copies, and C11 atomics only. The render path should remain free of sample-rate conversion, gain, EQ, compression, gating, and noise reduction unless a change explicitly targets those features and includes real-time and stability testing.
 
+Performance instrumentation may use monotonic clock reads and lock-free atomic counters. It must not allocate, log, format strings, update AppKit, or perform file or network I/O in a callback. UI formatting belongs in the main-thread metrics timer.
+
 ## Processing Constraints
 
 - The same-device path must remain a direct HAL callback
@@ -60,6 +63,8 @@ Changes to the audio path also require manual testing for:
 - Separate input and output devices
 - 32-frame and device-default buffer settings
 - Microphone permission denial
+- Clean and warning performance states
+- Deadline, cadence, bridge, and overload counters across a long session
 - Start, stop, restart, device switching, and application exit
 
 Report hardware and macOS version with audio behavior changes.

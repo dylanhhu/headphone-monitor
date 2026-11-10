@@ -14,7 +14,7 @@ make verify
 make run
 ```
 
-`make verify` rebuilds the application and validates its metadata, signature, and sandbox entitlements.
+`make verify` rebuilds the application, runs deterministic metrics tests, and validates metadata, signature, and sandbox entitlements.
 
 ## Manual Audio Test Matrix
 
@@ -31,6 +31,9 @@ Run the relevant cases when changing device negotiation, buffer sizing, callback
 | Stop and restart | Audio stops cleanly and restarts without duplicate callbacks |
 | Device switched while running | Old callbacks stop before the new stream starts |
 | Unplug selected device | The app does not crash; select a valid replacement |
+| Performance menu | Rates and counters update once per second |
+| Warning state | Relevant counters increment and change the status icon |
+| Reset counters | Counters clear without restarting the stream |
 
 Record the macOS version, Mac model, input device, output device, and sample rate with audio-path pull requests.
 
@@ -39,6 +42,8 @@ Record the macOS version, Mac model, input device, output device, and sample rat
 The CoreAudio callbacks are real-time critical. Do not add allocation, logging, file access, networking, locks, Objective-C calls, or unbounded loops to the I/O path.
 
 Keep the direct same-device path free of application buffering. Any additional processing must have a measured benefit and a documented latency cost.
+
+Performance instrumentation must remain bounded and lock-free. Do not move menu formatting or other Objective-C work into the callback. Use the existing one-second main-thread timer for presentation.
 
 ## Security And Privacy
 

@@ -5,6 +5,8 @@ All notable changes are documented here.
 ## Unreleased
 
 - Explore optional ultra-low-latency noise rejection within the real-time callback budget
+- Add callback deadline, cadence, bridge, underrun, drift, and CoreAudio overload monitoring
+- Add explicit INFO, OK, WARN, and ERROR states with status-icon severity
 
 ## 0.1.0 - 2026-11-10
 
