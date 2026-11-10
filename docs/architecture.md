@@ -20,6 +20,8 @@ The app enumerates CoreAudio devices through `kAudioHardwarePropertyDevices`, fi
 
 Only linear PCM float32 streams are accepted. Input and output nominal sample rates must match exactly within 0.5 Hz.
 
+Buffer requests are clamped to each driver's advertised range. The minimum request uses `ceil(range.mMinimum)` independently for input and output, reported as actual negotiated frame counts after start.
+
 ## Same-Device Path
 
 When the selected input and output use one `AudioDeviceID`, a single `AudioDeviceCreateIOProcID` callback receives both input and output buffers.
@@ -37,12 +39,13 @@ There is no application queue in this path.
 Separate devices use two HAL callbacks and a single-producer, single-consumer ring buffer.
 
 - Input callback writes the first input channel as float32 mono
-- Output callback reads frames and duplicates the mono signal across output channels
+- Output callback reads frames directly from the ring and duplicates the mono signal across output channels
 - Capacity is 16,384 frames
-- Initial target is two output device buffers
-- Drift handling discards one old frame when occupancy exceeds the target by two output buffers
+- Initial target is one input buffer plus one output buffer
+- The first output callback discards stale pre-roll beyond the target instead of replaying frames accumulated while output starts
+- Drift handling discards one old frame when occupancy exceeds the target by one input buffer plus one output buffer
 
-The bridge is allocated before either callback starts. Ring indices are C11 atomics with acquire/release ordering.
+The bridge is allocated before either callback starts. Ring indices are C11 atomics with acquire/release ordering. A separate scratch buffer is not used; mono output uses segmented `memcpy`, stereo output uses a two-channel fill loop, and other layouts use a bounded channel loop.
 
 ## Startup And Shutdown
 
@@ -57,6 +60,7 @@ The real-time callbacks record fixed-size metrics through C11 atomics:
 - Callback work exceeding one buffer period
 - Callback host-time gaps exceeding the expected period plus a fixed jitter allowance
 - Ring-buffer overflow, underrun, and drift-correction frames
+- Stale frames trimmed from the initial bridge prefill
 - `kAudioDeviceProcessorOverload` property notifications
 
 The main thread samples these counters once per second and updates the menu. It computes callback rates, average work, and bridge occupancy without affecting audio deadlines.
@@ -64,6 +68,14 @@ The main thread samples these counters once per second and updates the menu. It 
 Each menu row carries an explicit `INFO`, `OK`, `WARN`, or `ERROR` label. The summary derives from individual counter thresholds, and the status icon changes to an orange warning triangle or red error octagon while monitoring.
 
 The counters describe application-visible symptoms. They do not expose driver-internal drops or hardware glitches that never produce a late callback or CoreAudio overload notification.
+
+## Latency Floor
+
+The direct path adds no application buffer between HAL input and output. Its floor is determined by the selected device's input and output buffer periods, safety offsets, stream latency, driver, transport, and hardware conversion.
+
+The separate-device bridge adds one input buffer plus one output buffer of prefill because the two HAL callbacks are independent. Reducing that target to one output buffer would remove a buffer period but can underrun before the next input callback; the additional output-buffer margin covers callback phase and scheduling jitter.
+
+The public HAL API does not allow an application to reduce a read-only safety offset or device latency. Creating an aggregate device could fold both callbacks into one device, but it would add a clock domain plus subdevice drift compensation and possible hidden conversion outside the current explicit bridge model.
 
 ## Processing Boundary
 

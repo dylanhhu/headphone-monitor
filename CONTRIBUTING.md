@@ -25,6 +25,7 @@ Run the relevant cases when changing device negotiation, buffer sizing, callback
 | Same input and output device | Direct callback path, no extra application bridge |
 | Different input and output devices | Audio continues through the lock-free bridge |
 | Mismatched sample rates | Start is refused with an actionable message |
+| Minimum supported buffer | Uses each device's smallest legal buffer and reports the negotiated sizes |
 | 32-frame buffer | Starts if supported; otherwise clamps to the driver range |
 | Device-default buffer | Uses the current device buffer size |
 | Microphone permission denied | Start fails without a crash |

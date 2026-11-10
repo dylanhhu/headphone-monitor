@@ -11,6 +11,7 @@
 
 static const UInt32 kRingCapacityFrames = 16384;
 static const UInt32 kRingMask = kRingCapacityFrames - 1;
+static const UInt32 kRequestedMinimumBufferFrames = UINT32_MAX;
 
 typedef enum {
     MonitorErrorInvalidDevice = -1001,
@@ -34,6 +35,7 @@ typedef struct {
     _Atomic uint64_t outputUnderrunFrames;
     _Atomic uint64_t driftCorrectionEvents;
     _Atomic uint64_t driftCorrectionFrames;
+    _Atomic uint64_t startupTrimFrames;
     _Atomic uint64_t maxRingFrames;
     _Atomic uint64_t deviceOverloads;
 } AudioMetrics;
@@ -45,10 +47,11 @@ typedef struct {
 
 typedef struct {
     float *samples;
-    float *scratch;
     _Atomic uint64_t writeFrame;
     _Atomic uint64_t readFrame;
+    _Atomic int trimOnFirstRead;
     UInt32 targetFrames;
+    UInt32 inputFrames;
     UInt32 outputFrames;
     float lastSample;
     AudioMetrics *metrics;
@@ -105,6 +108,7 @@ static void ResetMetrics(AudioMetrics *metrics) {
     atomic_store_explicit(&metrics->outputUnderrunFrames, 0, memory_order_relaxed);
     atomic_store_explicit(&metrics->driftCorrectionEvents, 0, memory_order_relaxed);
     atomic_store_explicit(&metrics->driftCorrectionFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&metrics->startupTrimFrames, 0, memory_order_relaxed);
     atomic_store_explicit(&metrics->maxRingFrames, 0, memory_order_relaxed);
     atomic_store_explicit(&metrics->deviceOverloads, 0, memory_order_relaxed);
 }
@@ -185,6 +189,29 @@ static OSStatus GetBufferFrameSize(AudioDeviceID device, UInt32 *frames) {
     return AudioObjectGetPropertyData(device, &address, 0, NULL, &size, frames);
 }
 
+static UInt32 ResolveBufferFrameSize(UInt32 requestedFrames, AudioValueRange range) {
+    UInt32 target = requestedFrames == kRequestedMinimumBufferFrames ?
+                    (UInt32)ceil(range.mMinimum) : requestedFrames;
+    if ((double)target < range.mMinimum) {
+        target = (UInt32)ceil(range.mMinimum);
+    }
+    if ((double)target > range.mMaximum) {
+        target = (UInt32)floor(range.mMaximum);
+    }
+    return target;
+}
+
+static UInt32 BridgePrefillFrames(UInt32 inputFrames, UInt32 outputFrames) {
+    uint64_t targetFrames = (uint64_t)inputFrames + outputFrames;
+    if (targetFrames < 2) {
+        targetFrames = 2;
+    }
+    if (targetFrames > kRingCapacityFrames) {
+        targetFrames = kRingCapacityFrames;
+    }
+    return (UInt32)targetFrames;
+}
+
 static OSStatus SetBufferFrameSize(AudioDeviceID device, UInt32 requestedFrames, UInt32 *actualFrames) {
     if (requestedFrames > 0) {
         AudioObjectPropertyAddress rangeAddress = {
@@ -200,13 +227,7 @@ static OSStatus SetBufferFrameSize(AudioDeviceID device, UInt32 requestedFrames,
             return status;
         }
 
-        UInt32 target = requestedFrames;
-        if ((double)target < range.mMinimum) {
-            target = (UInt32)ceil(range.mMinimum);
-        }
-        if ((double)target > range.mMaximum) {
-            target = (UInt32)floor(range.mMaximum);
-        }
+        UInt32 target = ResolveBufferFrameSize(requestedFrames, range);
 
         AudioObjectPropertyAddress sizeAddress = {
             kAudioDevicePropertyBufferFrameSize,
@@ -255,6 +276,98 @@ static void ClearOutput(AudioBufferList *outputData) {
     }
 }
 
+static void CopyIntoRing(AudioRing *ring,
+                         uint64_t write,
+                         const float *input,
+                         UInt32 count,
+                         UInt32 inputChannels) {
+    if (count == 0) {
+        return;
+    }
+
+    UInt32 offset = (UInt32)write & kRingMask;
+    UInt32 firstCount = kRingCapacityFrames - offset;
+    if (firstCount > count) {
+        firstCount = count;
+    }
+    UInt32 secondCount = count - firstCount;
+
+    if (inputChannels == 1) {
+        memcpy(&ring->samples[offset], input, (size_t)firstCount * sizeof(float));
+        if (secondCount > 0) {
+            memcpy(ring->samples, input + firstCount,
+                   (size_t)secondCount * sizeof(float));
+        }
+        return;
+    }
+
+    for (UInt32 frame = 0; frame < firstCount; frame++) {
+        ring->samples[offset + frame] = input[frame * inputChannels];
+    }
+    for (UInt32 frame = 0; frame < secondCount; frame++) {
+        ring->samples[frame] = input[(firstCount + frame) * inputChannels];
+    }
+}
+
+static void FillOutputBufferFromRing(const AudioRing *ring,
+                                     uint64_t read,
+                                     UInt32 count,
+                                     UInt32 bufferFrames,
+                                     UInt32 channels,
+                                     float *output) {
+    if (output == NULL) {
+        return;
+    }
+
+    UInt32 copyCount = count < bufferFrames ? count : bufferFrames;
+    UInt32 offset = (UInt32)read & kRingMask;
+    UInt32 firstCount = kRingCapacityFrames - offset;
+    if (firstCount > copyCount) {
+        firstCount = copyCount;
+    }
+    UInt32 secondCount = copyCount - firstCount;
+
+    if (channels == 1) {
+        memcpy(output, &ring->samples[offset], (size_t)firstCount * sizeof(float));
+        if (secondCount > 0) {
+            memcpy(output + firstCount, ring->samples,
+                   (size_t)secondCount * sizeof(float));
+        }
+    } else if (channels == 2) {
+        for (UInt32 frame = 0; frame < firstCount; frame++) {
+            float sample = ring->samples[offset + frame];
+            output[frame * 2] = sample;
+            output[frame * 2 + 1] = sample;
+        }
+        for (UInt32 frame = 0; frame < secondCount; frame++) {
+            float sample = ring->samples[frame];
+            UInt32 outputFrame = firstCount + frame;
+            output[outputFrame * 2] = sample;
+            output[outputFrame * 2 + 1] = sample;
+        }
+    } else {
+        for (UInt32 frame = 0; frame < firstCount; frame++) {
+            float sample = ring->samples[offset + frame];
+            for (UInt32 channel = 0; channel < channels; channel++) {
+                output[frame * channels + channel] = sample;
+            }
+        }
+        for (UInt32 frame = 0; frame < secondCount; frame++) {
+            float sample = ring->samples[frame];
+            UInt32 outputFrame = firstCount + frame;
+            for (UInt32 channel = 0; channel < channels; channel++) {
+                output[outputFrame * channels + channel] = sample;
+            }
+        }
+    }
+
+    for (UInt32 frame = copyCount; frame < bufferFrames; frame++) {
+        for (UInt32 channel = 0; channel < channels; channel++) {
+            output[frame * channels + channel] = ring->lastSample;
+        }
+    }
+}
+
 static void RingPushFirstChannel(AudioRing *ring, const AudioBufferList *inputData) {
     if (inputData == NULL || inputData->mNumberBuffers == 0) {
         return;
@@ -279,9 +392,7 @@ static void RingPushFirstChannel(AudioRing *ring, const AudioBufferList *inputDa
                                   memory_order_relaxed);
     }
 
-    for (UInt32 frame = 0; frame < count; frame++) {
-        ring->samples[(write + frame) & kRingMask] = input[frame * inputChannels];
-    }
+    CopyIntoRing(ring, write, input, count, inputChannels);
     atomic_store_explicit(&ring->writeFrame, write + count, memory_order_release);
     AtomicUpdateMax(&ring->metrics->maxRingFrames, used + count);
 }
@@ -296,7 +407,19 @@ static void RingFillOutput(AudioRing *ring, AudioBufferList *outputData) {
     uint64_t read = atomic_load_explicit(&ring->readFrame, memory_order_relaxed);
     uint64_t available64 = write > read ? write - read : 0;
 
-    UInt32 highWater = ring->targetFrames + ring->outputFrames * 2;
+    if (atomic_exchange_explicit(&ring->trimOnFirstRead, 0, memory_order_acquire) &&
+        available64 > ring->targetFrames) {
+        uint64_t trimFrames = available64 - ring->targetFrames;
+        read += trimFrames;
+        available64 = ring->targetFrames;
+        atomic_store_explicit(&ring->readFrame, read, memory_order_release);
+        atomic_fetch_add_explicit(&ring->metrics->startupTrimFrames, trimFrames,
+                                  memory_order_relaxed);
+    }
+
+    uint64_t highWater64 = (uint64_t)ring->targetFrames + ring->inputFrames +
+                           ring->outputFrames;
+    UInt32 highWater = highWater64 > UINT32_MAX ? UINT32_MAX : (UInt32)highWater64;
     if (available64 > highWater) {
         atomic_fetch_add_explicit(&ring->metrics->driftCorrectionEvents, 1,
                                   memory_order_relaxed);
@@ -315,11 +438,8 @@ static void RingFillOutput(AudioRing *ring, AudioBufferList *outputData) {
         atomic_fetch_add_explicit(&ring->metrics->outputUnderrunFrames, frames - count,
                                   memory_order_relaxed);
     }
-    for (UInt32 frame = 0; frame < count; frame++) {
-        ring->scratch[frame] = ring->samples[(read + frame) & kRingMask];
-    }
     if (count > 0) {
-        ring->lastSample = ring->scratch[count - 1];
+        ring->lastSample = ring->samples[(read + count - 1) & kRingMask];
     }
     atomic_store_explicit(&ring->readFrame, read + count, memory_order_release);
 
@@ -331,12 +451,7 @@ static void RingFillOutput(AudioRing *ring, AudioBufferList *outputData) {
         }
         UInt32 channels = buffer->mNumberChannels > 0 ? buffer->mNumberChannels : 1;
         UInt32 bufferFrames = FrameCountForBuffer(buffer);
-        for (UInt32 frame = 0; frame < bufferFrames; frame++) {
-            float sample = frame < count ? ring->scratch[frame] : ring->lastSample;
-            for (UInt32 channel = 0; channel < channels; channel++) {
-                output[frame * channels + channel] = sample;
-            }
-        }
+        FillOutputBufferFromRing(ring, read, count, bufferFrames, channels, output);
     }
 }
 
@@ -539,9 +654,7 @@ static void StopEngine(MonitorEngine *engine) {
     }
     RemoveOverloadListeners(engine);
     free(engine->ring.samples);
-    free(engine->ring.scratch);
     engine->ring.samples = NULL;
-    engine->ring.scratch = NULL;
     engine->inputProcID = NULL;
     engine->outputProcID = NULL;
     engine->duplexProcID = NULL;
@@ -611,22 +724,19 @@ static OSStatus StartEngine(MonitorEngine *engine,
     }
 
     engine->ring.samples = calloc(kRingCapacityFrames, sizeof(float));
-    engine->ring.scratch = calloc(kRingCapacityFrames, sizeof(float));
-    if (engine->ring.samples == NULL || engine->ring.scratch == NULL) {
+    if (engine->ring.samples == NULL) {
         free(engine->ring.samples);
-        free(engine->ring.scratch);
         engine->ring.samples = NULL;
-        engine->ring.scratch = NULL;
         return MonitorErrorOutOfMemory;
     }
-    engine->ring.targetFrames = engine->outputBufferFrames * 2;
-    if (engine->ring.targetFrames < 2) {
-        engine->ring.targetFrames = 2;
-    }
+    engine->ring.targetFrames = BridgePrefillFrames(engine->inputBufferFrames,
+                                                     engine->outputBufferFrames);
+    engine->ring.inputFrames = engine->inputBufferFrames;
     engine->ring.outputFrames = engine->outputBufferFrames;
     engine->ring.metrics = &engine->metrics;
     atomic_init(&engine->ring.writeFrame, 0);
     atomic_init(&engine->ring.readFrame, 0);
+    atomic_init(&engine->ring.trimOnFirstRead, 0);
     InstallOverloadListener(engine, inputDevice, YES);
     InstallOverloadListener(engine, outputDevice, NO);
 
@@ -650,13 +760,14 @@ static OSStatus StartEngine(MonitorEngine *engine,
     }
     engine->inputStarted = YES;
 
-    for (UInt32 attempt = 0; attempt < 40; attempt++) {
+    uint64_t primeDeadline = MonotonicNanoseconds() + 200000000ULL;
+    while (MonotonicNanoseconds() < primeDeadline) {
         uint64_t write = atomic_load_explicit(&engine->ring.writeFrame, memory_order_acquire);
         uint64_t read = atomic_load_explicit(&engine->ring.readFrame, memory_order_relaxed);
         if (write - read >= engine->ring.targetFrames) {
             break;
         }
-        usleep(5000);
+        usleep(1000);
     }
     uint64_t primedFrames = atomic_load_explicit(&engine->ring.writeFrame, memory_order_acquire) -
                             atomic_load_explicit(&engine->ring.readFrame, memory_order_relaxed);
@@ -665,6 +776,7 @@ static OSStatus StartEngine(MonitorEngine *engine,
         return MonitorErrorNoInput;
     }
 
+    atomic_store_explicit(&engine->ring.trimOnFirstRead, 1, memory_order_release);
     status = AudioDeviceStart(outputDevice, engine->outputProcID);
     if (status != noErr) {
         StopEngine(engine);
@@ -783,6 +895,7 @@ typedef struct {
     uint64_t outputUnderrunFrames;
     uint64_t driftCorrectionEvents;
     uint64_t driftCorrectionFrames;
+    uint64_t startupTrimFrames;
     uint64_t maxRingFrames;
     uint64_t deviceOverloads;
     uint64_t ringFrames;
@@ -816,6 +929,8 @@ static MetricsSnapshot SnapshotMetrics(const MonitorEngine *engine) {
                                                        memory_order_relaxed),
         .driftCorrectionFrames = atomic_load_explicit(&engine->metrics.driftCorrectionFrames,
                                                        memory_order_relaxed),
+        .startupTrimFrames = atomic_load_explicit(&engine->metrics.startupTrimFrames,
+                                                  memory_order_relaxed),
         .maxRingFrames = atomic_load_explicit(&engine->metrics.maxRingFrames,
                                               memory_order_relaxed),
         .deviceOverloads = atomic_load_explicit(&engine->metrics.deviceOverloads,
@@ -841,6 +956,7 @@ typedef NS_ENUM(NSInteger, PerformanceMenuTag) {
     PerformanceUnderrunsTag,
     PerformanceInputDropsTag,
     PerformanceDriftTag,
+    PerformanceStartupTrimTag,
     PerformanceOverloadsTag,
 };
 
@@ -1022,6 +1138,8 @@ static NSString *PerformanceSeverityLabel(PerformanceSeverity severity) {
                                                        tag:PerformanceInputDropsTag]];
     [submenu addItem:[self performanceMetricItemWithTitle:@"Drift corrections: unavailable"
                                                        tag:PerformanceDriftTag]];
+    [submenu addItem:[self performanceMetricItemWithTitle:@"Startup trim: unavailable"
+                                                       tag:PerformanceStartupTrimTag]];
     [submenu addItem:[self performanceMetricItemWithTitle:@"CoreAudio overloads: unavailable"
                                                        tag:PerformanceOverloadsTag]];
     [submenu addItem:[NSMenuItem separatorItem]];
@@ -1090,6 +1208,7 @@ static NSString *PerformanceSeverityLabel(PerformanceSeverity severity) {
         [self setPerformanceTitle:@"Output underruns: unavailable" forTag:PerformanceUnderrunsTag];
         [self setPerformanceTitle:@"Input drops: unavailable" forTag:PerformanceInputDropsTag];
         [self setPerformanceTitle:@"Drift corrections: unavailable" forTag:PerformanceDriftTag];
+        [self setPerformanceTitle:@"Startup trim: unavailable" forTag:PerformanceStartupTrimTag];
         [self setPerformanceTitle:@"CoreAudio overloads: unavailable" forTag:PerformanceOverloadsTag];
         self.performanceRoot.title = @"Performance";
         self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"mic.fill"
@@ -1189,7 +1308,7 @@ static NSString *PerformanceSeverityLabel(PerformanceSeverity severity) {
         double maxFillMs = _engine.sampleRate > 0 ?
                            (double)snapshot.maxRingFrames * 1000.0 / _engine.sampleRate : 0;
         PerformanceSeverity bridgeSeverity = snapshot.ringFrames == 0 ? PerformanceSeverityError :
-                                             snapshot.ringFrames < _engine.ring.targetFrames ?
+                                             snapshot.ringFrames < _engine.ring.outputFrames ?
                                              PerformanceSeverityWarning : PerformanceSeverityOK;
         [self setPerformanceTitle:[NSString stringWithFormat:@"Bridge: %llu frames (%.2f ms), max %.2f ms",
                                                              (unsigned long long)snapshot.ringFrames,
@@ -1239,6 +1358,10 @@ static NSString *PerformanceSeverityLabel(PerformanceSeverity severity) {
     if (driftSeverity == PerformanceSeverityWarning) {
         warningCount++;
     }
+
+    [self setPerformanceTitle:[NSString stringWithFormat:@"Startup trim: %llu stale frames",
+                                                         (unsigned long long)snapshot.startupTrimFrames]
+                       forTag:PerformanceStartupTrimTag];
 
     PerformanceSeverity overloadSeverity = snapshot.deviceOverloads > 0 ?
                                            PerformanceSeverityError : PerformanceSeverityOK;
@@ -1300,10 +1423,12 @@ static NSString *PerformanceSeverityLabel(PerformanceSeverity severity) {
 - (NSMenuItem *)bufferMenuItem {
     NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"Buffer Size" action:nil keyEquivalent:@""];
     NSMenu *submenu = [[NSMenu alloc] initWithTitle:@"Buffer Size"];
-    NSArray<NSNumber *> *sizes = @[@0, @16, @32, @64, @128, @256];
+    NSArray<NSNumber *> *sizes = @[@(kRequestedMinimumBufferFrames), @0, @16, @32, @64, @128, @256];
     for (NSNumber *number in sizes) {
         UInt32 frames = number.unsignedIntValue;
-        NSString *label = frames == 0 ? @"Device Default" : [NSString stringWithFormat:@"%u frames", frames];
+        NSString *label = frames == kRequestedMinimumBufferFrames ? @"Minimum Supported" :
+                          frames == 0 ? @"Device Default" :
+                          [NSString stringWithFormat:@"%u frames", frames];
         NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:label
                                                      action:@selector(selectBufferSize:)
                                               keyEquivalent:@""];

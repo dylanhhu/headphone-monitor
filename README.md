@@ -13,7 +13,7 @@ This is an early `0.1.0` prototype intended for local testing and further latenc
 - Direct input-to-output copy when both directions use the same CoreAudio device
 - Lock-free bridge when input and output use different devices
 - Device selection from the menu bar
-- Selectable buffer sizes, defaulting to 32 frames
+- Selectable buffer sizes, including the device-reported minimum, defaulting to 32 frames
 - Exact sample-rate matching with no hidden resampling
 - Live callback, deadline, cadence, bridge, and CoreAudio overload counters
 - App Sandbox with microphone input as the only privileged entitlement
@@ -65,6 +65,10 @@ Run the deterministic metrics tests independently with `make test`.
 
 The `N frames` setting controls the CoreAudio device buffer request. At 48 kHz, 32 frames corresponds to 0.667 ms per buffer before operating-system and hardware overhead.
 
+**Minimum Supported** requests the smallest legal buffer reported by each selected device. The resulting input and output sizes can differ when the devices expose different ranges; the Performance menu reports the actual negotiated sizes.
+
+The minimum is a driver allowance, not a guarantee of glitch-free operation. If deadline, cadence, underrun, or overload counters rise, select the next larger buffer.
+
 Latency is lowest when:
 
 - Input and output use one physical CoreAudio device
@@ -72,7 +76,7 @@ Latency is lowest when:
 - Output is wired rather than Bluetooth or AirPlay
 - The device accepts a small buffer without dropouts
 
-The separate-device path primes two output buffers, so its application-side bridge contributes at least two device-buffer periods in addition to input and output latency.
+The separate-device path primes one input buffer plus one output buffer, which is the previous two-output-buffer target when the devices use equal sizes. Its application-side bridge therefore contributes up to that prefill interval in addition to input and output latency. Once prefill completes, the first output callback discards any stale frames accumulated while waiting for CoreAudio to start the output stream, keeping the bridge at its intended occupancy.
 
 ## Performance Monitoring
 
@@ -83,6 +87,7 @@ Open **Performance** in the menu to inspect the current session:
 - Deadline misses when callback work exceeds one device-buffer period
 - Cadence misses when callbacks arrive later than expected
 - Current and maximum bridge occupancy for separate devices
+- Frames discarded from stale pre-start bridge prefill
 - Output underruns, input ring overflows, and clock-drift corrections
 - CoreAudio processor-overload notifications
 
@@ -98,7 +103,7 @@ Current thresholds:
 - Callback work at 75% or more of the shortest buffer period is `WARN`; 100% or more is `ERROR`
 - Any deadline miss, output underrun, input-ring drop, or CoreAudio overload is `ERROR`
 - Any cadence miss is `WARN`; cadence misses at 0.1% or more of callbacks are `ERROR`
-- A bridged-device fill below the target is `WARN`; an empty bridge is `ERROR`
+- A bridged-device fill below one output buffer is `WARN`; an empty bridge is `ERROR`
 - Any drift correction is `WARN` because it implies missing or repeated samples, even when inaudible
 - Callback rates below 80% of the expected device rate are `WARN`; below 50% are `ERROR`
 

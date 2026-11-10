@@ -26,6 +26,15 @@ int main(void) {
         AudioMetrics metrics = {0};
         ResetMetrics(&metrics);
 
+        AudioValueRange bufferRange = { .mMinimum = 14.0, .mMaximum = 4096.0 };
+        assert(ResolveBufferFrameSize(kRequestedMinimumBufferFrames, bufferRange) == 14);
+        assert(ResolveBufferFrameSize(1, bufferRange) == 14);
+        assert(ResolveBufferFrameSize(32, bufferRange) == 32);
+        assert(ResolveBufferFrameSize(8192, bufferRange) == 4096);
+        assert(BridgePrefillFrames(16, 32) == 48);
+        assert(BridgePrefillFrames(32, 32) == 64);
+        assert(BridgePrefillFrames(512, 32) == 544);
+
         CallbackTiming timing = {0};
         AudioTimeStamp now = {0};
         now.mFlags = kAudioTimeStampHostTimeValid;
@@ -42,7 +51,6 @@ int main(void) {
 
         AudioRing ring = {0};
         ring.samples = calloc(kRingCapacityFrames, sizeof(float));
-        ring.scratch = calloc(kRingCapacityFrames, sizeof(float));
         ring.metrics = &metrics;
         ring.targetFrames = 32;
         ring.outputFrames = 16;
@@ -62,6 +70,11 @@ int main(void) {
         RingPushFirstChannel(&ring, input);
         RingFillOutput(&ring, output);
         assert(atomic_load(&metrics.outputUnderrunEvents) == 1);
+        float *outputSamples = output->mBuffers[0].mData;
+        for (UInt32 frame = 0; frame < 16; frame++) {
+            assert(outputSamples[frame * 2] == 1.0f);
+            assert(outputSamples[frame * 2 + 1] == 1.0f);
+        }
 
         AudioBufferList *largeInput = CreateBufferList(16384, 1);
         RingPushFirstChannel(&ring, largeInput);
@@ -69,6 +82,47 @@ int main(void) {
         RingPushFirstChannel(&ring, overflowInput);
         assert(atomic_load(&metrics.inputDropEvents) > 0);
         assert(atomic_load(&metrics.inputDropFrames) > 0);
+
+        ResetMetrics(&metrics);
+        atomic_store(&ring.writeFrame, 0);
+        atomic_store(&ring.readFrame, 0);
+        ring.lastSample = 0;
+        atomic_store(&ring.trimOnFirstRead, 1);
+        AudioBufferList *trimInput = CreateBufferList(64, 1);
+        float *trimSamples = trimInput->mBuffers[0].mData;
+        for (UInt32 frame = 0; frame < 64; frame++) {
+            trimSamples[frame] = (float)frame;
+        }
+        RingPushFirstChannel(&ring, trimInput);
+        RingFillOutput(&ring, output);
+        assert(atomic_load(&metrics.startupTrimFrames) == 32);
+        assert(outputSamples[0] == 32.0f);
+        assert(outputSamples[31] == 47.0f);
+
+        ResetMetrics(&metrics);
+        uint64_t wrapStart = kRingCapacityFrames - 8;
+        atomic_store(&ring.writeFrame, wrapStart);
+        atomic_store(&ring.readFrame, wrapStart);
+        AudioBufferList *wrapInput = CreateBufferList(16, 1);
+        float *wrapSamples = wrapInput->mBuffers[0].mData;
+        for (UInt32 frame = 0; frame < 16; frame++) {
+            wrapSamples[frame] = (float)(100 + frame);
+        }
+        RingPushFirstChannel(&ring, wrapInput);
+        RingFillOutput(&ring, output);
+        assert(outputSamples[0] == 100.0f);
+        assert(outputSamples[14] == 107.0f);
+        assert(outputSamples[16] == 108.0f);
+        assert(outputSamples[30] == 115.0f);
+
+        ResetMetrics(&metrics);
+        ring.inputFrames = 512;
+        ring.targetFrames = 544;
+        ring.outputFrames = 32;
+        atomic_store(&ring.writeFrame, 1024);
+        atomic_store(&ring.readFrame, 0);
+        RingFillOutput(&ring, output);
+        assert(atomic_load(&metrics.driftCorrectionEvents) == 0);
 
         AudioObjectPropertyAddress overload = {
             kAudioDeviceProcessorOverload,
@@ -83,9 +137,10 @@ int main(void) {
         DestroyBufferList(input);
         DestroyBufferList(largeInput);
         DestroyBufferList(overflowInput);
+        DestroyBufferList(trimInput);
+        DestroyBufferList(wrapInput);
         DestroyBufferList(output);
         free(ring.samples);
-        free(ring.scratch);
         printf("metrics tests passed\n");
     }
     return 0;
